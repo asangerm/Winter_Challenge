@@ -1,0 +1,239 @@
+import sys
+from collections import deque
+
+# ─── Helpers ───────────────────────────────────────────────────────────────────
+
+def in_bounds(x, y, width, height):
+    return 0 <= x < width and 0 <= y < height
+
+def build_solid_set(grid, snakes, width, height, exclude_id=None, power_sources=None):
+    """Cases solides : plateformes + corps des snakes + énergie."""
+    solid = set()
+    for y in range(height):
+        for x in range(width):
+            if grid[y][x] == '#':
+                solid.add((x, y))
+    for sid, body in snakes.items():
+        if sid == exclude_id:
+            continue
+        for cell in body:
+            solid.add(cell)
+    if power_sources:
+        for ps in power_sources:
+            solid.add(ps)
+    return solid
+
+def apply_gravity_body(body, solid, height):
+    """Fait tomber le body jusqu'à ce qu'il soit soutenu. Retourne None si hors map."""
+    def is_supported(b):
+        for x, y in b:
+            if (x, y + 1) in solid or y + 1 >= height:
+                # y+1 >= height = sol du bas (hors grille = tombe)
+                if y + 1 >= height:
+                    continue
+                return True
+        return False
+
+    # Vérifie si déjà soutenu
+    if is_supported(body):
+        return body
+
+    fallen = [(x, y + 1) for x, y in body]
+    for _ in range(height):
+        # Vérifie si un segment est hors map
+        if any(y >= height for x, y in fallen):
+            return None
+        if is_supported(fallen):
+            return fallen
+        fallen = [(x, y + 1) for x, y in fallen]
+
+    return None
+
+def get_direction(from_body, to_body):
+    """Retourne la direction (dx,dy) entre l'ancienne et la nouvelle tête."""
+    fx, fy = from_body[0]
+    tx, ty = to_body[0]
+    return (tx - fx, ty - fy)
+
+DIRS = {'UP': (0, -1), 'DOWN': (0, 1), 'LEFT': (-1, 0), 'RIGHT': (1, 0)}
+DIR_NAME = {v: k for k, v in DIRS.items()}
+
+def move_body(body, direction):
+    dx, dy = direction
+    hx, hy = body[0]
+    new_head = (hx + dx, hy + dy)
+    return [new_head] + body[:-1]
+
+# ─── BFS pour trouver le chemin vers une source ────────────────────────────────
+
+def bfs_path(body, target, solid_static, snakes, my_snake_id, width, height, power_sources):
+    """
+    Retourne (distance, première_direction) vers target, ou (None, None).
+    solid_static = plateformes uniquement (pas les corps qui bougent).
+    """
+    # On construit les solides : plateformes + corps adverses (pas le snake lui-même)
+    solid_others = set(solid_static)
+    for sid, b in snakes.items():
+        if sid != my_snake_id:
+            for cell in b:
+                solid_others.add(cell)
+    # L'énergie est solide sauf la cible
+    for ps in power_sources:
+        if ps != target:
+            solid_others.add(ps)
+
+    start_key = tuple(body)
+    queue = deque()
+    queue.append((body, None))  # (body, first_direction)
+    visited = {start_key}
+
+    while queue:
+        current_body, first_dir = queue.popleft()
+
+        if current_body[0] == target:
+            return first_dir
+
+        head = current_body[0]
+
+        for dname, (dx, dy) in DIRS.items():
+            nx, ny = head[0] + dx, head[1] + dy  # BUG : head est un tuple (x,y)
+
+        # Correction : head = (hx, hy)
+        hx, hy = current_body[0]
+        for dname, (dx, dy) in DIRS.items():
+            nx, ny = hx + dx, hy + dy
+
+            # Hors grille horizontalement : autorisé temporairement (snake peut dépasser)
+            # mais on évite pour simplifier
+            if not in_bounds(nx, ny, width, height):
+                continue
+
+            # Collision avec solide
+            if (nx, ny) in solid_others:
+                # Cas collision tête -> destruction si len >= 3, sinon suppression
+                if len(current_body) >= 3:
+                    # La tête est détruite, le body raccourcit
+                    new_body = current_body[1:]  # on perd la tête
+                else:
+                    continue  # snake supprimé, inutile
+
+                # Appliquer gravité au body réduit
+                new_body_after = apply_gravity_body(new_body, solid_others, height)
+                if new_body_after is None:
+                    continue
+            else:
+                new_body = move_body(current_body, (dx, dy))
+                # Gravité
+                new_body_after = apply_gravity_body(new_body, solid_others, height)
+                if new_body_after is None:
+                    continue
+
+            key = tuple(new_body_after)
+            if key in visited:
+                continue
+            visited.add(key)
+
+            fd = first_dir if first_dir is not None else (dx, dy)
+            queue.append((new_body_after, fd))
+
+    return None
+
+# ─── Init ──────────────────────────────────────────────────────────────────────
+
+my_id = int(input())
+width = int(input())
+height = int(input())
+base_grid = []
+for i in range(height):
+    base_grid.append(input())
+
+snakebots_per_player = int(input())
+my_snakes = [int(input()) for _ in range(snakebots_per_player)]
+opp_snakes = [int(input()) for _ in range(snakebots_per_player)]
+
+# Plateformes (statiques)
+solid_static = set()
+for y in range(height):
+    for x in range(width):
+        if base_grid[y][x] == '#':
+            solid_static.add((x, y))
+
+# Mémoire des directions
+last_dir = {sid: (0, -1) for sid in my_snakes}  # UP par défaut
+
+# ─── Game loop ─────────────────────────────────────────────────────────────────
+
+while True:
+    power_source_count = int(input())
+    power_sources = []
+    for _ in range(power_source_count):
+        x, y = map(int, input().split())
+        power_sources.append((x, y))
+
+    snakebot_count = int(input())
+    snakes = {}
+    for _ in range(snakebot_count):
+        parts = input().split()
+        sid = int(parts[0])
+        body = [tuple(map(int, p.split(','))) for p in parts[1].split(':')]
+        snakes[sid] = body
+
+    actions = []
+
+    # Assigner chaque snake à la source la plus proche
+    available_sources = list(power_sources)
+    assignments = {}  # snake_id -> target
+
+    # Tri des snakes par longueur décroissante (priorité aux petits pour grandir vite)
+    alive_my = [sid for sid in my_snakes if sid in snakes]
+
+    for sid in alive_my:
+        body = snakes[sid]
+        best_dir = None
+        best_dist = 10**9
+        best_src = None
+
+        for src in available_sources:
+            direction = bfs_path(
+                body, src, solid_static, snakes, sid,
+                width, height, power_sources
+            )
+            if direction is not None:
+                # Estimation distance via Manhattan pour trier (BFS retourne seulement direction)
+                hx, hy = body[0]
+                sx, sy = src
+                dist = abs(hx - sx) + abs(hy - sy)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_dir = direction
+                    best_src = src
+
+        if best_src:
+            available_sources.remove(best_src)
+            assignments[sid] = best_src
+
+        if best_dir is not None:
+            dir_name = DIR_NAME.get(best_dir)
+            if dir_name:
+                # Évite le demi-tour (direction opposée)
+                last = last_dir[sid]
+                opposite = (-best_dir[0], -best_dir[1])
+                if best_dir == opposite:
+                    # Garder la dernière direction
+                    best_dir = last
+                    dir_name = DIR_NAME.get(best_dir, 'UP')
+                last_dir[sid] = best_dir
+                actions.append(f"{sid} {dir_name}")
+        else:
+            # Pas de cible trouvée : continuer dans la même direction
+            dir_name = DIR_NAME.get(last_dir[sid], 'UP')
+            actions.append(f"{sid} {dir_name}")
+
+    if not actions:
+        actions.append("WAIT")
+
+    print(";".join(actions))
+
+    # Debug
+    print(f"Targets: {assignments}", file=sys.stderr, flush=True)
+    print(f"Power sources: {power_sources}", file=sys.stderr, flush=True)
