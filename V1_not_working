@@ -1,0 +1,186 @@
+import sys
+import math
+from collections import deque
+
+# fonction de simulation de mouvement
+def move_snake(body, direction):
+
+    dx, dy = direction
+    hx, hy = body[0]
+
+    new_head = (hx+dx, hy+dy)
+
+    new_body = [new_head] + body[:-1]
+
+    return new_body
+
+# fonction pour appliquer la gravité sur une coord
+def apply_gravity(body, grid, height):
+
+    if is_supported(body, grid, height):
+        return body
+
+    fallen = [(x, y+1) for x, y in body]
+
+    while not is_supported(fallen, grid, height):
+
+        new = []
+        for x, y in fallen:
+            if y+1 >= height:
+                return None  # snake tombe hors map
+            new.append((x, y+1))
+
+        fallen = new
+
+    return fallen
+
+# fonction qui vérifie si des coordonnées sont dans les limites
+def in_bounds(x, y):
+    return 0 <= x < width and 0 <= y < height
+
+# fonction vérifiant la solidité d'une case
+def is_solid(x, y, grid):
+    return grid[y][x] == '#'
+
+# fonction pour vérifier si le snake est soutenu
+def is_supported(body, grid, height):
+    for x, y in body:
+        if y+1 < height and grid[y+1][x] == '#':
+            return True
+    return False
+
+# fonction pour trouver la distance vers une source
+def bfs_distance(start_body, target, grid, width, height):
+
+    queue = deque()
+    visited = set()
+
+    queue.append((start_body, 0))
+    visited.add(tuple(start_body))
+
+    while queue:
+
+        body, dist = queue.popleft()
+
+        if body[0] == target:
+            return dist
+
+        for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+
+            new_body = move_snake(body, (dx,dy))
+            hx, hy = new_body[0]
+
+            if not (0 <= hx < width and 0 <= hy < height):
+                continue
+
+            if grid[hy][hx] in ['#','o','0']:
+                continue
+
+            new_body = apply_gravity(new_body, grid, height)
+
+            if new_body is None:
+                continue
+
+            key = tuple(new_body)
+
+            if key in visited:
+                continue
+
+            visited.add(key)
+            queue.append((new_body, dist + 1))
+
+    return None
+
+# fonction pour assigner des sources à mes snakes
+def assign_targets(snakes, my_snakes, power_sources, grid, width, height):
+
+    assignments = {}
+    available_sources = set(power_sources)
+
+    for snake_id in my_snakes:
+
+        if snake_id not in snakes:
+            continue
+
+        head = snakes[snake_id][0]
+
+        best_source = None
+        best_dist = 10**9
+
+        for source in available_sources:
+
+            dist = bfs_distance(head, source, grid, width, height)
+
+            if dist is not None and dist < best_dist:
+                best_dist = dist
+                best_source = source
+
+        if best_source:
+            assignments[snake_id] = best_source
+            available_sources.remove(best_source)
+
+    return assignments
+
+# mon id de player
+my_id = int(input())
+
+# setup de la grille de jeu de base
+width = int(input())
+height = int(input())
+base_grid = []
+for i in range(height):
+    base_grid.append(list(input()))
+
+# id des snakes pour chaque player
+my_snakes = set()
+opp_snakes = set()
+snakebots_per_player = int(input())
+for i in range(snakebots_per_player):
+    my_snakes.add(int(input()))
+for i in range(snakebots_per_player):
+    opp_snakes.add(int(input()))
+
+# game loop
+while True:
+    # actualisation de la grille
+    grid = [row[:] for row in base_grid]
+
+    # position des sources
+    power_sources = []
+    power_source_count = int(input())
+    for i in range(power_source_count):
+        x, y = [int(j) for j in input().split()]
+        power_sources.append((x, y))
+        grid[y][x] = '$'
+    
+    # position des snakes
+    snakes = {}
+    snakebot_count = int(input())
+    for _ in range(snakebot_count):
+        snakebot_id, body = input().split()
+        snakebot_id = int(snakebot_id)
+        coords = [tuple(map(int, p.split(','))) for p in body.split(':')]
+        snakes[snakebot_id] = coords
+
+        for x, y in coords:
+            if in_bounds(x, y):
+                grid[y][x] = '0' if snakebot_id in my_snakes else 'o'
+
+    # assignation des sources
+    targets = assign_targets(snakes, my_snakes, power_sources, grid, width, height)
+
+    # Write an action using print
+    # To debug: print("Debug messages...", file=sys.stderr, flush=True)
+
+    # actions
+    print("WAIT")
+
+    # debug
+    for y in range(height):
+        print(y, "".join(grid[y]), file=sys.stderr, flush=True)
+    print("My snakes : ", my_snakes ,file=sys.stderr, flush=True)
+    print("Opp snakes : ", opp_snakes ,file=sys.stderr, flush=True)
+    print("Power sources : ", power_source_count, file=sys.stderr, flush=True)
+    print(" Positions : ", power_sources, power_source_count, file=sys.stderr, flush=True)
+    print("Snakes : ", snakes, file=sys.stderr, flush=True)
+    print("Targets:", targets, file=sys.stderr, flush=True)
