@@ -1,0 +1,251 @@
+import sys
+import math
+from collections import deque
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
+
+DIRECTIONS = {
+    'UP':    (0, -1),
+    'DOWN':  (0,  1),
+    'LEFT':  (-1, 0),
+    'RIGHT': (1,  0),
+}
+
+OPPOSITE = {'UP': 'DOWN', 'DOWN': 'UP', 'LEFT': 'RIGHT', 'RIGHT': 'LEFT'}
+
+def in_bounds(x, y):
+    return 0 <= x < width and 0 <= y < height
+
+def is_solid(x, y, grid):
+    """Renvoie True si la case est un obstacle (mur, corps de snake, énergie)."""
+    if not in_bounds(x, y):
+        return False
+    return grid[y][x] in ('#', '0', 'o', '$')
+
+def is_walkable(x, y, grid):
+    """Renvoie True si on peut déplacer la tête vers cette case."""
+    if not in_bounds(x, y):
+        return False
+    return grid[y][x] not in ('#', '0', 'o')
+
+def simulate_fall(body, grid):
+    """
+    Simule la gravité : fait tomber le corps jusqu'à ce qu'il soit soutenu.
+    Retourne le nouveau corps, ou None si le snake tombe hors de la grille.
+
+    Support = appui EXTERNE uniquement (murs, autres snakes dans grid).
+    Le corps propre du snake ne se supporte PAS lui-même (confirmé par le jeu).
+    grid doit être grid_for_snake (corps propre effacé, autres snakes présents).
+    """
+    body = list(body)
+    for _ in range(height):  # borne max = hauteur de la carte
+        supported = False
+        for bx, by in body:
+            below = by + 1
+            if below >= height:
+                return None  # tombe hors de la grille → mort
+            if is_solid(bx, below, grid):
+                supported = True
+                break
+        if supported:
+            return body
+        # Tombe d'une ligne
+        body = [(bx, by + 1) for bx, by in body]
+    return None
+
+# ─── BFS avec simulation de la chute ────────────────────────────────────────
+
+def bfs(start_body, targets, grid_for_fall, grid_for_bfs):
+    """
+    grid_for_fall : corps effacé -> simulate_fall sans auto-support.
+    grid_for_bfs  : corps = obstacle sauf queue -> BFS 2D évite l'auto-collision.
+    """
+    if not targets:
+        return None
+
+    head = start_body[0]
+
+    # ── Direction interdite : demi-tour (tête vers 2ème segment) ─────────────
+    forbidden_dir = None
+    if len(start_body) >= 2:
+        dx_back = start_body[1][0] - head[0]
+        dy_back = start_body[1][1] - head[1]
+        forbidden_dir = next(
+            (d for d, (dx, dy) in DIRECTIONS.items() if dx == dx_back and dy == dy_back),
+            None
+        )
+
+    # ── Étape 1 : calcule les premiers pas valides + leur tête atterrie ──────
+    valid_first_steps = {}   # dir_name → landed_head après gravité complète
+
+    for dir_name, (dx, dy) in DIRECTIONS.items():
+        if dir_name == forbidden_dir:
+            continue
+        nx, ny = head[0] + dx, head[1] + dy
+        if not in_bounds(nx, ny):
+            continue
+
+        if is_walkable(nx, ny, grid_for_fall):
+            new_body = [(nx, ny)] + list(start_body[:-1])
+            fallen = simulate_fall(new_body, grid_for_fall)
+            if fallen is not None and fallen[0] != head:
+                # Rejette si déplacement net nul (snake glisse et revient au départ)
+                valid_first_steps[dir_name] = fallen[0]
+
+    if not valid_first_steps:
+        return None
+
+    # ── Étape 2 : BFS 2D depuis les têtes atterries, sans gravité ────────────
+    # L'état est simplement la position 2D de la tête.
+    # On évite les faux-négatifs d'une simulation de chute partielle.
+
+    visited = {head}
+    queue = deque()
+
+    for dir_name, landed_head in valid_first_steps.items():
+        if landed_head not in visited:
+            visited.add(landed_head)
+            if landed_head in targets:
+                return dir_name
+            queue.append((landed_head, dir_name))
+
+    while queue:
+        pos, first_dir = queue.popleft()
+
+        for _, (dx, dy) in DIRECTIONS.items():
+            nx, ny = pos[0] + dx, pos[1] + dy
+            if in_bounds(nx, ny) and is_walkable(nx, ny, grid_for_bfs) and (nx, ny) not in visited:
+                visited.add((nx, ny))
+                if (nx, ny) in targets:
+                    return first_dir
+                queue.append(((nx, ny), first_dir))
+
+    return None  # aucun chemin trouvé
+
+# ─── Fallback : direction la plus sûre ──────────────────────────────────────
+
+def safe_fallback(body, grid_for_fall, grid_for_bfs):
+    """Choisit n'importe quelle direction qui ne tue pas immédiatement (sans demi-tour)."""
+    head = body[0]
+    forbidden_dir = None
+    if len(body) >= 2:
+        dx_back = body[1][0] - head[0]
+        dy_back = body[1][1] - head[1]
+        forbidden_dir = next(
+            (d for d, (dx, dy) in DIRECTIONS.items() if dx == dx_back and dy == dy_back),
+            None
+        )
+    for dir_name, (dx, dy) in DIRECTIONS.items():
+        if dir_name == forbidden_dir:
+            continue
+        nx, ny = head[0] + dx, head[1] + dy
+        if in_bounds(nx, ny) and is_walkable(nx, ny, grid_for_fall):
+            new_body = [(nx, ny)] + list(body[:-1])
+            if simulate_fall(new_body, grid_for_fall) is not None:
+                return dir_name
+    return 'UP'  # dernier recours absolu
+
+# ─── Initialisation ─────────────────────────────────────────────────────────
+
+my_id = int(input())
+width = int(input())
+height = int(input())
+base_grid = []
+for _ in range(height):
+    base_grid.append(list(input()))
+
+my_snakes = set()
+opp_snakes = set()
+snakebots_per_player = int(input())
+for _ in range(snakebots_per_player):
+    my_snakes.add(int(input()))
+for _ in range(snakebots_per_player):
+    opp_snakes.add(int(input()))
+
+# ─── Boucle de jeu ──────────────────────────────────────────────────────────
+
+while True:
+    # Reconstruction de la grille à chaque tour
+    grid = [row[:] for row in base_grid]
+
+    # Lecture des sources d'énergie
+    power_sources = []
+    power_source_count = int(input())
+    for _ in range(power_source_count):
+        x, y = map(int, input().split())
+        power_sources.append((x, y))
+        grid[y][x] = '$'
+
+    # Lecture des snakebots
+    snakes = {}
+    snakebot_count = int(input())
+    for _ in range(snakebot_count):
+        line = input().split()
+        snakebot_id = int(line[0])
+        body_str = line[1]
+        coords = [tuple(map(int, p.split(','))) for p in body_str.split(':')]
+        snakes[snakebot_id] = coords
+        for x, y in coords:
+            if in_bounds(x, y):
+                grid[y][x] = '0' if snakebot_id in my_snakes else 'o'
+
+    # Calcul des actions
+    targets = set(power_sources)
+    actions = []
+
+    # Debug global
+    print(f"=== TOUR | targets({len(targets)}): {sorted(targets)}", file=sys.stderr, flush=True)
+    print(f"    my_snakes en jeu: {[sid for sid in my_snakes if sid in snakes]}", file=sys.stderr, flush=True)
+
+    for snake_id in my_snakes:
+        if snake_id not in snakes:
+            print(f"  Snake {snake_id} → absent de la grille (mort?)", file=sys.stderr, flush=True)
+            continue
+
+        body = snakes[snake_id]
+        head = body[0]
+
+        # Distance à chaque target pour comprendre ce que voit le snake
+        dists = sorted(
+            [(t, round(math.sqrt((t[0]-head[0])**2 + (t[1]-head[1])**2), 1)) for t in targets],
+            key=lambda x: x[1]
+        )
+        print(f"  Snake {snake_id} | head={head} | len={len(body)} | targets par distance: {dists[:5]}", file=sys.stderr, flush=True)
+
+        # grid_for_fall : corps propre effacé → simulate_fall ne s'auto-supporte pas
+        grid_for_fall = [row[:] for row in grid]
+        for bx, by in body:
+            if in_bounds(bx, by):
+                grid_for_fall[by][bx] = '.'
+
+        # grid_for_bfs : corps propre = obstacle SAUF la queue (libérée au prochain tour)
+        # Empêche de planifier un chemin qui traverse son propre corps
+        grid_for_bfs = [row[:] for row in grid]
+        tail = body[-1]
+        for bx, by in body[:-1]:   # tout sauf la queue
+            if in_bounds(bx, by):
+                grid_for_bfs[by][bx] = '0'
+        if in_bounds(tail[0], tail[1]):
+            grid_for_bfs[tail[1]][tail[0]] = '.'
+
+        # BFS vers l'énergie la plus proche
+        direction = bfs(body, targets, grid_for_fall, grid_for_bfs)
+
+        if direction is None:
+            direction = safe_fallback(body, grid_for_fall, grid_for_bfs)
+            print(f"  Snake {snake_id} → BFS ECHEC, fallback={direction}", file=sys.stderr, flush=True)
+        else:
+            print(f"  Snake {snake_id} → BFS OK, direction={direction}", file=sys.stderr, flush=True)
+
+        actions.append(f"{snake_id} {direction}")
+
+    print(";".join(actions) if actions else "WAIT")
+
+    # debug
+    for y in range(height):
+        print(y, "".join(grid[y]), file=sys.stderr, flush=True)
+    print("My snakes : ", my_snakes ,file=sys.stderr, flush=True)
+    print("Opp snakes : ", opp_snakes ,file=sys.stderr, flush=True)
+    print("Power sources : ", power_source_count, file=sys.stderr, flush=True)
+    print(" Positions : ", power_sources, power_source_count, file=sys.stderr, flush=True)
+    print("Snakes : ", snakes, file=sys.stderr, flush=True)
