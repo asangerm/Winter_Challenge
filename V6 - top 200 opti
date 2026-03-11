@@ -1,0 +1,374 @@
+import sys
+import math
+from collections import deque
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
+
+DIRECTIONS = {
+    'UP':    (0, -1),
+    'DOWN':  (0,  1),
+    'LEFT':  (-1, 0),
+    'RIGHT': (1,  0),
+}
+
+OPPOSITE = {'UP': 'DOWN', 'DOWN': 'UP', 'LEFT': 'RIGHT', 'RIGHT': 'LEFT'}
+
+def in_bounds(x, y):
+    return 0 <= x < width and 0 <= y < height
+
+def is_solid(x, y, grid):
+    """Renvoie True si la case est un obstacle (mur, corps de snake, énergie)."""
+    if not in_bounds(x, y):
+        return False
+    return grid[y][x] in ('#', '0', 'o', '$')
+
+def is_walkable(x, y, grid):
+    """Renvoie True si on peut déplacer la tête vers cette case.
+    Le snake peut sortir de la map horizontalement (x hors bornes), mais pas verticalement."""
+    if y < 0 or y >= height:
+        return False
+    if x < 0 or x >= width:
+        return True  # hors map horizontal = traversable (gravité gère la survie)
+    return grid[y][x] not in ('#', '0', 'o')
+
+def simulate_fall(body, grid):
+    """
+    Simule la gravité : fait tomber le corps jusqu'à ce qu'il soit soutenu.
+    Retourne le nouveau corps, ou None si le snake tombe hors de la grille.
+
+    - Un segment hors map horizontalement (x < 0 ou x >= width) ne peut pas
+      trouver d'appui (pas de sol) mais ne tue pas le snake seul.
+    - Le snake meurt si un segment IN-BOUNDS tombe sous y >= height.
+    - Le snake meurt si TOUS les segments sont hors map horizontalement
+      (aucun appui possible, chute infinie).
+    """
+    body = list(body)
+    for _ in range(height):
+        supported = False
+        for bx, by in body:
+            if not (0 <= bx < width):
+                continue  # hors map horizontal : pas d'appui possible
+            below = by + 1
+            if below >= height:
+                return None  # segment in-bounds tombe sous la carte → mort
+            if is_solid(bx, below, grid):
+                supported = True
+                break
+        if supported:
+            return body
+        # Tous hors map horizontal → chute infinie → mort
+        if all(not (0 <= bx < width) for bx, by in body):
+            return None
+        body = [(bx, by + 1) for bx, by in body]
+    return None
+
+# ─── BFS corrigé (gravity 1er pas seulement, BFS 2D ensuite) + vérif espace ──
+
+def flood_fill_space(start, grid, blocked):
+    """Compte les cases accessibles depuis start."""
+    if not (0 <= start[0] < width and 0 <= start[1] < height):
+        return 0
+    visited = {start}
+    queue = deque([start])
+    count = 0
+    while queue:
+        cx, cy = queue.popleft()
+        count += 1
+        for dx, dy in DIRECTIONS.values():
+            nx, ny = cx + dx, cy + dy
+            p = (nx, ny)
+            if p not in visited and 0 <= ny < height and 0 <= nx < width:
+                if is_walkable(nx, ny, grid) and p not in blocked:
+                    visited.add(p)
+                    queue.append(p)
+    return count
+
+
+def bfs(start_body, targets, grid_for_fall, grid_for_bfs):
+    if not targets:
+        return None
+
+    head = start_body[0]
+    body_len = len(start_body)
+    body_set = set(start_body[1:-1])  # pour flood fill (hors queue)
+
+    forbidden_dir = None
+    if len(start_body) >= 2:
+        dx_back = start_body[1][0] - head[0]
+        dy_back = start_body[1][1] - head[1]
+        forbidden_dir = next(
+            (d for d, (dx, dy) in DIRECTIONS.items()
+             if dx == dx_back and dy == dy_back), None
+        )
+
+    # ── Étape 1 : calcule les premiers pas + atterrissage ────────────────────
+    valid_first_steps = {}  # dir_name → (landed_head, fallen_body)
+
+    for dir_name, (dx, dy) in DIRECTIONS.items():
+        if dir_name == forbidden_dir:
+            continue
+        nx, ny = head[0] + dx, head[1] + dy
+        if ny < 0 or ny >= height:
+            continue
+        if not is_walkable(nx, ny, grid_for_fall):
+            continue
+
+        new_body = [(nx, ny)] + list(start_body[:-1])
+        fallen = simulate_fall(new_body, grid_for_fall)
+        if fallen is None:
+            continue
+        if fallen[0] == head:
+            continue  # aucun déplacement net → inutile
+
+        # Vérification d'espace minimal après atterrissage
+        space = flood_fill_space(fallen[0], grid_for_bfs, set(fallen[1:-1]))
+        if space < max(body_len, 4):
+            print(f"    → {dir_name} rejeté (space={space}, besoin>={max(body_len, 4)})", file=sys.stderr, flush=True)
+            continue
+
+        valid_first_steps[dir_name] = (fallen[0], space)
+
+    if not valid_first_steps:
+        return None
+
+    # ── Étape 2 : BFS 2D depuis les têtes atterries ──────────────────────────
+    visited = {head}
+    queue = deque()
+
+    # Trier par espace décroissant pour explorer les directions sûres en premier
+    for dir_name, (landed_head, space) in sorted(
+        valid_first_steps.items(), key=lambda x: -x[1][1]
+    ):
+        if landed_head not in visited:
+            visited.add(landed_head)
+            if landed_head in targets:
+                return dir_name
+            queue.append((landed_head, dir_name))
+
+    while queue:
+        pos, first_dir = queue.popleft()
+        for _, (dx, dy) in DIRECTIONS.items():
+            nx, ny = pos[0] + dx, pos[1] + dy
+            if (0 <= ny < height and 0 <= nx < width
+                    and is_walkable(nx, ny, grid_for_bfs)
+                    and (nx, ny) not in visited):
+                visited.add((nx, ny))
+                if (nx, ny) in targets:
+                    return first_dir
+                queue.append(((nx, ny), first_dir))
+
+    return None
+
+
+# ─── Fallback avec flood fill ────────────────────────────────────────────────
+
+def safe_fallback(body, grid_for_fall, grid_for_bfs):
+    head = body[0]
+    forbidden_dir = None
+    if len(body) >= 2:
+        dx_back = body[1][0] - head[0]
+        dy_back = body[1][1] - head[1]
+        forbidden_dir = next(
+            (d for d, (dx, dy) in DIRECTIONS.items()
+             if dx == dx_back and dy == dy_back), None
+        )
+
+    best_dir = None
+    best_space = -1
+
+    for dir_name, (dx, dy) in DIRECTIONS.items():
+        if dir_name == forbidden_dir:
+            continue
+        nx, ny = head[0] + dx, head[1] + dy
+        if ny < 0 or ny >= height:
+            continue
+        if not is_walkable(nx, ny, grid_for_fall):
+            continue
+
+        new_body = [(nx, ny)] + list(body[:-1])
+        fallen = simulate_fall(new_body, grid_for_fall)
+        if fallen is None:
+            continue
+
+        space = flood_fill_space(fallen[0], grid_for_bfs, set(fallen[1:-1]))
+        print(f"    fallback {dir_name}: space={space}", file=sys.stderr, flush=True)
+        if space > best_space:
+            best_space = space
+            best_dir = dir_name
+
+    if best_dir:
+        return best_dir
+
+    for dir_name in ('RIGHT', 'LEFT', 'DOWN', 'UP'):
+        if dir_name == forbidden_dir:
+            continue
+        dx, dy = DIRECTIONS[dir_name]
+        nx, ny = head[0] + dx, head[1] + dy
+        if 0 <= ny < height and is_walkable(nx, ny, grid_for_fall):
+            return dir_name
+    return 'RIGHT'
+
+# ─── Assignation des cibles aux snakes ──────────────────────────────────────
+
+def assign_targets(snake_ids, snakes, targets):
+    if not targets or not snake_ids:
+        return {sid: set(targets) for sid in snake_ids}
+
+    targets_list = list(targets)
+    assignment = {sid: set() for sid in snake_ids}
+    active_ids = [sid for sid in snake_ids if sid in snakes]
+
+    for t in targets_list:
+        best_sid = min(
+            active_ids,
+            key=lambda sid: (snakes[sid][0][0] - t[0])**2 + (snakes[sid][0][1] - t[1])**2
+        )
+        assignment[best_sid].add(t)
+
+    # Fallback : snake sans cible → ses N cibles les plus proches (pas toutes)
+    for sid in active_ids:
+        if not assignment[sid]:
+            head = snakes[sid][0]
+            closest = sorted(
+                targets_list,
+                key=lambda t: (head[0]-t[0])**2 + (head[1]-t[1])**2
+            )[:3]  # les 3 plus proches seulement
+            assignment[sid] = set(closest)
+
+    return assignment
+
+# ─── Initialisation ─────────────────────────────────────────────────────────
+
+my_id = int(input())
+width = int(input())
+height = int(input())
+base_grid = []
+for _ in range(height):
+    base_grid.append(list(input()))
+
+my_snakes = set()
+opp_snakes = set()
+snakebots_per_player = int(input())
+for _ in range(snakebots_per_player):
+    my_snakes.add(int(input()))
+for _ in range(snakebots_per_player):
+    opp_snakes.add(int(input()))
+
+# ─── Boucle de jeu ──────────────────────────────────────────────────────────
+
+while True:
+    # Reconstruction de la grille à chaque tour
+    grid = [row[:] for row in base_grid]
+
+    # Lecture des sources d'énergie
+    power_sources = []
+    power_source_count = int(input())
+    for _ in range(power_source_count):
+        x, y = map(int, input().split())
+        power_sources.append((x, y))
+        grid[y][x] = '$'
+
+    # Lecture des snakebots
+    snakes = {}
+    snakebot_count = int(input())
+    for _ in range(snakebot_count):
+        line = input().split()
+        snakebot_id = int(line[0])
+        body_str = line[1]
+        coords = [tuple(map(int, p.split(','))) for p in body_str.split(':')]
+        snakes[snakebot_id] = coords
+        for x, y in coords:
+            if in_bounds(x, y):
+                grid[y][x] = '0' if snakebot_id in my_snakes else 'o'
+
+    # Calcul des actions
+    targets = set(power_sources)
+    actions = []
+
+    # Debug global
+    print(f"=== TOUR | targets({len(targets)}): {sorted(targets)}", file=sys.stderr, flush=True)
+    print(f"    my_snakes en jeu: {[sid for sid in my_snakes if sid in snakes]}", file=sys.stderr, flush=True)
+
+    # committed_grid reflète les positions FUTURES des alliés déjà traités.
+    # Chaque snake voit où ses alliés vont atterrir, pas juste où ils sont.
+    committed_grid = [row[:] for row in grid]
+    active_my_snakes = [sid for sid in my_snakes if sid in snakes]
+    snake_targets = assign_targets(active_my_snakes, snakes, targets)
+
+    print(f"  Assignation: { {sid: sorted(snake_targets[sid]) for sid in active_my_snakes} }",
+        file=sys.stderr, flush=True)
+    for snake_id in my_snakes:
+        if snake_id not in snakes:
+            print(f"  Snake {snake_id} → absent de la grille (mort?)", file=sys.stderr, flush=True)
+            continue
+
+        body = snakes[snake_id]
+        head = body[0]
+
+        # Distance à chaque target pour comprendre ce que voit le snake
+        dists = sorted(
+            [(t, round(math.sqrt((t[0]-head[0])**2 + (t[1]-head[1])**2), 1)) for t in targets],
+            key=lambda x: x[1]
+        )
+        print(f"  Snake {snake_id} | head={head} | len={len(body)} | targets par distance: {dists[:5]}", file=sys.stderr, flush=True)
+
+        # grid_for_fall : corps propre effacé (depuis committed_grid)
+        grid_for_fall = [row[:] for row in committed_grid]
+        for bx, by in body:
+            if in_bounds(bx, by):
+                grid_for_fall[by][bx] = '.'
+
+        # grid_for_bfs : corps propre = obstacle sauf queue (depuis committed_grid)
+        grid_for_bfs = [row[:] for row in committed_grid]
+        tail = body[-1]
+        for bx, by in body[:-1]:
+            if in_bounds(bx, by):
+                grid_for_bfs[by][bx] = '0'
+        if in_bounds(tail[0], tail[1]):
+            grid_for_bfs[tail[1]][tail[0]] = '.'
+
+        # BFS vers l'énergie la plus proche
+        my_targets = snake_targets.get(snake_id, targets)
+        direction = bfs(body, my_targets, grid_for_fall, grid_for_bfs)
+
+        # Fallback : si BFS échoue sur cibles assignées, tenter toutes les cibles
+        if direction is None and my_targets != targets:
+            direction = bfs(body, targets, grid_for_fall, grid_for_bfs)
+            if direction:
+                print(f"  Snake {snake_id} → BFS OK sur toutes cibles (fallback targets)", file=sys.stderr, flush=True)
+
+
+        if direction is None:
+            direction = safe_fallback(body, grid_for_fall, grid_for_bfs)
+            print(f"  Snake {snake_id} → BFS ECHEC, fallback={direction}", file=sys.stderr, flush=True)
+        else:
+            print(f"  Snake {snake_id} → BFS OK, direction={direction}", file=sys.stderr, flush=True)
+
+        actions.append(f"{snake_id} {direction}")
+
+        # Mettre à jour committed_grid avec la position future de ce snake.
+        if direction:
+            dx, dy = DIRECTIONS[direction]
+            hx, hy = body[0]
+            new_body_candidate = [(hx + dx, hy + dy)] + list(body[:-1])
+            fallen_body = simulate_fall(new_body_candidate, grid_for_fall)
+            next_body = fallen_body if fallen_body else body
+            # Effacer l'ancienne position
+            for bx, by in body:
+                if in_bounds(bx, by) and committed_grid[by][bx] == '0':
+                    committed_grid[by][bx] = '.'
+            # Marquer la nouvelle position
+            for bx, by in next_body:
+                if in_bounds(bx, by):
+                    committed_grid[by][bx] = '0'
+
+    print(";".join(actions) if actions else "WAIT")
+
+    # debug
+    for y in range(height):
+        print(y, "".join(grid[y]), file=sys.stderr, flush=True)
+    print("My snakes : ", my_snakes ,file=sys.stderr, flush=True)
+    print("Opp snakes : ", opp_snakes ,file=sys.stderr, flush=True)
+    print("Power sources : ", power_source_count, file=sys.stderr, flush=True)
+    print(" Positions : ", power_sources, power_source_count, file=sys.stderr, flush=True)
+    print("Snakes : ", snakes, file=sys.stderr, flush=True)
