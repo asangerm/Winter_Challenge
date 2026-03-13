@@ -1,0 +1,321 @@
+import sys
+import time
+from collections import deque
+
+DIRS = [('UP', 0, -1), ('DOWN', 0, 1), ('LEFT', -1, 0), ('RIGHT', 1, 0)]
+
+# ══════════════════════════════════════════════════════════════
+#  INITIALISATION
+# ══════════════════════════════════════════════════════════════
+my_id = int(input())
+width  = int(input())
+height = int(input())
+base_grid = [list(input()) for _ in range(height)]
+
+my_snakes  = set()
+opp_snakes = set()
+snakebots_per_player = int(input())
+for _ in range(snakebots_per_player):
+    my_snakes.add(int(input()))
+for _ in range(snakebots_per_player):
+    opp_snakes.add(int(input()))
+
+
+# ══════════════════════════════════════════════════════════════
+#  HELPERS GRILLE
+# ══════════════════════════════════════════════════════════════
+def cell(grid, x, y):
+    """'.' si hors-largeur (depassement autorise), sinon contenu de la case."""
+    if x < 0 or x >= width:
+        return '.'
+    return grid[y][x]
+
+
+# ══════════════════════════════════════════════════════════════
+#  PHYSIQUE : GRAVITE
+# ══════════════════════════════════════════════════════════════
+def is_supported(body, sgrid, eaten):
+    """
+    Verifie si le snake est soutenu.
+    FIX 4 : 'eaten' est un frozenset de positions d'energie deja mangees
+    dans la simulation BFS — elles ne comptent plus comme solides.
+    """
+    bset = set(body)
+    for x, y in body:
+        by = y + 1
+        if by >= height:
+            continue
+        if (x, by) in bset:
+            continue
+        if (x, by) in eaten:
+            continue   # FIX 4 : energie mangee = vide
+        if cell(sgrid, x, by) in ('#', '0', 'o', '$'):
+            return True
+    return False
+
+
+def apply_gravity(body, sgrid, eaten):
+    """Fait tomber le snake jusqu'a etre soutenu. Retourne None si mort."""
+    body = list(body)
+    for _ in range(height + 1):
+        if is_supported(body, sgrid, eaten):
+            return body
+        new_body = []
+        for x, y in body:
+            if y + 1 >= height:
+                return None
+            new_body.append((x, y + 1))
+        body = new_body
+    return None
+
+
+# ══════════════════════════════════════════════════════════════
+#  SIMULATION D'UN MOUVEMENT
+# ══════════════════════════════════════════════════════════════
+def sim_move(body, dx, dy, sgrid, eaten):
+    """
+    Simule un deplacement + gravite.
+    Retourne (nouveau_corps, nouveau_eaten) ou (None, eaten) si fatal.
+
+    FIX 3 — Queue walkable :
+      - Move vers case normale : la queue se libere -> on exclut body[-1] du
+        set de collision. La tete PEUT aller ou est la queue actuellement.
+      - Move vers '$' : le snake grandit, la queue reste -> on inclut body[-1].
+
+    FIX 4 — Energie mangee dans la sim :
+      - 'eaten' est propage dans apply_gravity pour une physique coherente.
+    """
+    hx, hy = body[0]
+    nx, ny  = hx + dx, hy + dy
+
+    if ny < 0 or ny >= height:
+        return None, eaten
+
+    c = cell(sgrid, nx, ny)
+
+    # FIX 4 : energie deja mangee dans cette simulation = case vide
+    if (nx, ny) in eaten:
+        c = '.'
+
+    # FIX 3 : tail walkable selon si on mange ou non
+    if c == '$':
+        bset = set(body)       # grandit -> tail reste occupee
+    else:
+        bset = set(body[:-1])  # tail se libere
+
+    if c in ('#', '0', 'o') or (nx, ny) in bset:
+        return None, eaten
+
+    if c == '$':
+        new_body  = [(nx, ny)] + list(body)
+        new_eaten = eaten | {(nx, ny)}
+    else:
+        new_body  = [(nx, ny)] + list(body[:-1])
+        new_eaten = eaten
+
+    result = apply_gravity(new_body, sgrid, new_eaten)
+    return result, new_eaten
+
+
+# ══════════════════════════════════════════════════════════════
+#  FIX 1 — DETECTION D'IMPASSE (flood-fill heuristique)
+# ══════════════════════════════════════════════════════════════
+def count_reachable(hx, hy, sgrid, body_set, eaten, limit):
+    """
+    Flood-fill simplifie depuis (hx, hy) pour detecter les voies sans issue.
+    Ignore la gravite complete (heuristique rapide).
+    S'arrete a 'limit' cellules pour rester dans le budget temps.
+    """
+    start = (hx, hy)
+    visited = {start}
+    queue   = deque([start])
+    while queue and len(visited) < limit:
+        x, y = queue.popleft()
+        for _, dx, dy in DIRS:
+            nx2, ny2 = x + dx, y + dy
+            if (nx2, ny2) in visited:
+                continue
+            if ny2 < 0 or ny2 >= height:
+                continue
+            if (nx2, ny2) in body_set:
+                continue
+            c = cell(sgrid, nx2, ny2)
+            if (nx2, ny2) in eaten:
+                c = '.'
+            if c in ('#', '0', 'o'):
+                continue
+            visited.add((nx2, ny2))
+            queue.append((nx2, ny2))
+    return len(visited)
+
+
+# ══════════════════════════════════════════════════════════════
+#  BFS AVEC PHYSIQUE COMPLETE
+# ══════════════════════════════════════════════════════════════
+def bfs(body, targets, sgrid, ps_count, time_budget_ms=12):
+    """
+    BFS physique complet. Retourne (direction, cible_atteinte) ou (None, None).
+
+    FIX 1 : au niveau 1, skip les directions menant a une impasse
+            (flood_fill < len(body)), sauf si c'est la derniere energie.
+    FIX 2 : retourne la cible reellement atteinte (pas juste Manhattan).
+    FIX 3 : via sim_move (tail walkable).
+    FIX 4 : 'eaten' propage dans la file pour physique coherente.
+    """
+    if not targets:
+        return None, None
+
+    target_set = set(targets)
+    t0         = time.time()
+    visited    = {(tuple(body), frozenset())}
+    queue      = deque()
+
+    for name, dx, dy in DIRS:
+        nb, ne = sim_move(body, dx, dy, sgrid, frozenset())
+        if nb is None:
+            continue
+
+        # FIX 1 : verification d'impasse au premier niveau
+        if ps_count > 1:
+            free = count_reachable(
+                nb[0][0], nb[0][1], sgrid,
+                frozenset(nb[:-1]), ne,
+                limit=len(body) * 2
+            )
+            if free < len(body):
+                continue   # impasse -> on evite
+
+        state = (tuple(nb), ne)
+        if state in visited:
+            continue
+        visited.add(state)
+
+        if nb[0] in target_set:
+            return name, nb[0]
+
+        queue.append((nb, name, ne))
+
+    while queue:
+        if (time.time() - t0) * 1000 >= time_budget_ms:
+            break
+        cur_body, first, cur_eaten = queue.popleft()
+
+        for _, dx, dy in DIRS:
+            nb, ne = sim_move(cur_body, dx, dy, sgrid, cur_eaten)
+            if nb is None:
+                continue
+            state = (tuple(nb), ne)
+            if state in visited:
+                continue
+            visited.add(state)
+
+            if nb[0] in target_set:
+                return first, nb[0]   # FIX 2 : cible vraiment atteinte
+
+            queue.append((nb, first, ne))
+
+    return None, None
+
+
+def best_survival_move(body, sgrid):
+    """
+    FIX 1 : fallback qui choisit la direction avec le plus grand espace libre
+    plutot que la premiere venue.
+    """
+    best_dir   = None
+    best_space = -1
+    for name, dx, dy in DIRS:
+        nb, ne = sim_move(body, dx, dy, sgrid, frozenset())
+        if nb is None:
+            continue
+        space = count_reachable(
+            nb[0][0], nb[0][1], sgrid,
+            frozenset(nb[:-1]), ne,
+            limit=300
+        )
+        if space > best_space:
+            best_space = space
+            best_dir   = name
+    return best_dir
+
+
+# ══════════════════════════════════════════════════════════════
+#  BOUCLE DE JEU
+# ══════════════════════════════════════════════════════════════
+while True:
+    t_start = time.time()
+
+    grid = [row[:] for row in base_grid]
+
+    power_sources = []
+    ps_count = int(input())
+    for _ in range(ps_count):
+        x, y = map(int, input().split())
+        power_sources.append((x, y))
+        grid[y][x] = '$'
+
+    snakes     = {}
+    sbot_count = int(input())
+    for _ in range(sbot_count):
+        parts  = input().split()
+        sid    = int(parts[0])
+        coords = [tuple(map(int, p.split(','))) for p in parts[1].split(':')]
+        snakes[sid] = coords
+        mark = '0' if sid in my_snakes else 'o'
+        for x, y in coords:
+            if 0 <= x < width and 0 <= y < height:
+                grid[y][x] = mark
+
+    # Tri des snakes vivants par distance a l'energie la plus proche
+    plans = []
+    for sid in my_snakes:
+        if sid not in snakes:
+            continue
+        body = snakes[sid]
+        hx, hy = body[0]
+        best_d = min(
+            (abs(tx - hx) + abs(ty - hy) for tx, ty in power_sources),
+            default=9999
+        )
+        plans.append((best_d, sid))
+    plans.sort()
+
+    actions  = []
+    assigned = {}   # FIX 2 : target -> sid (cible reellement attribuee par BFS)
+    n_alive        = max(len(plans), 1)
+    time_per_snake = max(1, 40 // n_alive)
+
+    for _, sid in plans:
+        body = snakes[sid]
+        hx, hy = body[0]
+
+        # Grille statique sans le corps du snake courant
+        sgrid = [row[:] for row in grid]
+        for x, y in body:
+            if 0 <= x < width and 0 <= y < height:
+                sgrid[y][x] = '.'
+
+        # FIX 2 : cibles non encore attribuees en priorite, sinon toutes
+        avail = [t for t in power_sources if t not in assigned] or power_sources
+
+        move, reached = bfs(body, avail, sgrid, ps_count, time_budget_ms=time_per_snake)
+
+        # FIX 2 : enregistre la cible reellement atteinte par le BFS
+        if reached and reached not in assigned:
+            assigned[reached] = sid
+
+        # FIX 1 : si aucun chemin viable, choisit la survie maximale
+        if move is None:
+            move = best_survival_move(body, sgrid)
+
+        if move:
+            actions.append(f"{sid} {move}")
+
+    print(";".join(actions) if actions else "WAIT")
+
+    # Debug stderr
+    elapsed = (time.time() - t_start) * 1000
+    print(f"=> {elapsed:.1f}ms | alive={[s for s in my_snakes if s in snakes]} | powers={ps_count}",
+          file=sys.stderr, flush=True)
+    for y in range(height):
+        print(f"{y:2d} {''.join(grid[y])}", file=sys.stderr, flush=True)
