@@ -1,0 +1,149 @@
+import sys
+import math
+
+""" Fonction vérifiant si une case de la grille est solide ou non """
+def is_solid(x, y, grid):
+    return grid[y][x] in ('#', '0', 'o', '$')
+
+""" Fonction vérifiant si la tête du snake peut s'y diriger ou non,
+je ne vérifies pas en largeur car le snake peut dépasser de la map en largeur
+à condition qu'il soit supporté par l'une de ces parties du corps par une case solide
+sans quoi il tomberai dans le vide en dehors de la map """
+def is_walkable(x, y, grid):
+    if y < 0 or y >= height:
+        return False
+    return grid[y][x] not in ('#', '0', 'o')
+
+""" mon id de player, inutilisé """
+my_id = int(input())
+
+""" largeur officielle de la map, utile pour stocker la map, mais à ne pas prendre en
+compte comme limite lors des déplacements """
+width = int(input())
+
+""" hauteur de la map et limite naturelle """
+height = int(input())
+
+""" tableau de string représentant la map vierge, sans power et sans snake, utilise
+pour reset la map à chaque tour de boucle de jeux et effacer les anciennes positions
+des snakes et power obsolètes, pour éviter une trace qui serait pas représentative 
+de l'état du jeu """
+base_grid = []
+for _ in range(height):
+    base_grid.append(list(input()))
+""" petite précision, l'origine de la map se trouvant en haut à gauche (0,0),
+pour parcourir la map on commence par le y puis le x: map[y][x] """
+
+""" set de mes identifiants de snakes, la taille peut varier car en fonction de la seed
+de la map, le nombre de snakes au départ peut changer entre 1 et 4 """
+my_snakes = set()
+
+""" pareil pour ceux de l'adversaire """
+opp_snakes = set()
+
+""" nombre de snakes par player """
+snakebots_per_player = int(input())
+for _ in range(snakebots_per_player):
+    my_snakes.add(int(input()))
+for _ in range(snakebots_per_player):
+    opp_snakes.add(int(input()))
+
+""" Boucle de jeu, tout ce qu'il y a avant ce bout de code ne sera fait qu'une fois, et tout
+ce qui sera fait après sera répété jusqu'a ce que la partie soit terminée:
+200 tours / équipe décimée / aucun power"""
+while True:
+    """ reset de la grille de jeu en utilisant la base_grig vierge """
+    grid = [row[:] for row in base_grid]
+    
+    """ lecture des sources d'énergie, je stocke leurs position dans un tableau
+    et je change le caractère de la map correspondant pour qu'il soit visible
+    dans le debug et utilisable pour vérifier la case dans la grille """
+    power_sources = []
+    power_source_count = int(input())
+    for _ in range(power_source_count):
+        x, y = map(int, input().split())
+        power_sources.append((x, y))
+        grid[y][x] = '$'
+
+    """ lecture des snakebots, je remplace mes snakes par 0 sur la map et par o pour les
+    ennemies """
+    snakes = {}
+    snakebot_count = int(input())
+    for _ in range(snakebot_count):
+        line = input().split()
+        snakebot_id = int(line[0])
+        body_str = line[1]
+        coords = [tuple(map(int, p.split(','))) for p in body_str.split(':')]
+        snakes[snakebot_id] = coords
+        for x, y in coords:
+            grid[y][x] = '0' if snakebot_id in my_snakes else 'o'
+    
+    """ action par défaut pour ne pas faire planter le code, à changer rapidement """
+    print("WAIT")
+
+    """ debug """
+    for y in range(height):
+        print(y, "".join(grid[y]), file=sys.stderr, flush=True)
+    print("My snakes : ", my_snakes ,file=sys.stderr, flush=True)
+    print("Opp snakes : ", opp_snakes ,file=sys.stderr, flush=True)
+    print("Power sources : ", power_source_count, file=sys.stderr, flush=True)
+    print(" Positions : ", power_sources, power_source_count, file=sys.stderr, flush=True)
+    print("Snakes : ", snakes, file=sys.stderr, flush=True)
+
+    """ notes: 
+    - pour ce qui est du déplacement, la physique est particulière. quand on donne une
+    direction a un snake, sa tête va essayer de l'atteindre, par exemple si un serpent
+    de taille 3 alligné de taille verticalement essaye d'aller vers le haut, il va
+    faire une sorte de saut, mais comme sa queue n'est plus en contact avec le sol,
+    dans le même tour il est ramené au sol par gravité. on pourrait donc penser qu'aller
+    vers le haut quand on est aligné verticalement est inutile, mais il existe un cas
+    où ça peut être utile, c'est si la case au dessus du serpent est un power, à ce moment
+    là, le snake en sautant atteint la source et grandit de 1 et on se retrouve avec un
+    snake de 4 de haut, voici un schéma:
+        . . .
+        . 0 .
+        . 0 .
+        . 0 .
+        # # #
+    dans ce cas si UP, retournera dans la même position au début du prochain tour
+        . $ .
+        . 0 .
+        . 0 .
+        . 0 .
+        # # #
+    par contre dans ce cas si il UP, il va manger la source et grandir ce qui donne:
+        . 0 .
+        . 0 .
+        . 0 .
+        . 0 .
+        # # #
+    Pareil pour le cas ou il va sur le côté. Imaginons qu'il veuille aller a droite,
+    il va essayer d'atteindre la case a la droite de sa tête mais si sa queue n'est
+    plus en contact avec le sol, tout le corps va tomber d'un cran et donc au lieu
+    d'atteindre la case directement à sa droite, au début du prochain tour la tête du
+    snake sera en bas à droite de l'origine. Le seul cas où ça diffère c'est si à droite
+    de la tête il y a un power, exemple:
+        . . . .
+        . 0 . .
+        . 0 . .
+        . 0 . .
+        # # # #
+    va donner:
+        . . . .
+        . . . .
+        . 0 0 .
+        . 0 . .
+        # # # #
+    alors que:
+        . . . .
+        . 0 $ .
+        . 0 . .
+        . 0 . .
+        # # # # 
+    va donner:
+        . . . .
+        . 0 0 .
+        . 0 . .
+        . 0 . .
+        # # # #
+    """
