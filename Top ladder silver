@@ -1,0 +1,457 @@
+import sys
+import time
+import heapq
+from collections import deque
+
+DIRS = [('UP', 0, -1), ('DOWN', 0, 1), ('LEFT', -1, 0), ('RIGHT', 1, 0)]
+INF  = float('inf')
+
+# ══════════════════════════════════════════════════════════════
+#  INITIALISATION
+# ══════════════════════════════════════════════════════════════
+my_id = int(input())
+width  = int(input())
+height = int(input())
+base_grid = [list(input()) for _ in range(height)]
+
+my_snakes  = set()
+opp_snakes = set()
+snakebots_per_player = int(input())
+for _ in range(snakebots_per_player):
+    my_snakes.add(int(input()))
+for _ in range(snakebots_per_player):
+    opp_snakes.add(int(input()))
+
+turn = 0
+
+
+# ══════════════════════════════════════════════════════════════
+#  HELPERS GRILLE
+# ══════════════════════════════════════════════════════════════
+def cell(grid, x, y):
+    """'.' si hors-largeur (depassement lateral autorise)."""
+    if x < 0 or x >= width:
+        return '.'
+    return grid[y][x]
+
+
+# ══════════════════════════════════════════════════════════════
+#  PHYSIQUE : GRAVITE
+# ══════════════════════════════════════════════════════════════
+def is_supported(body, sgrid, eaten):
+    bset = set(body)
+
+    for x, y in body:
+        by = y + 1
+        if by >= height:
+            continue
+
+        if (x, by) in bset or (x, by) in eaten:
+            continue
+
+        # 🔴 empêcher d'utiliser une tête comme support
+        if (x, by) in all_heads:
+            continue
+
+        if cell(sgrid, x, by) in ('#', '0', 'o', '$'):
+            return True
+
+    return False
+
+
+def apply_gravity(body, sgrid, eaten):
+    """Fait tomber le snake case par case jusqu'au support. None = mort."""
+    body = list(body)
+    for _ in range(height + 1):
+        if is_supported(body, sgrid, eaten):
+            return body
+        new_body = []
+        for x, y in body:
+            if y + 1 >= height:
+                return None
+            new_body.append((x, y + 1))
+        body = new_body
+    return None
+
+def void_fall_safe(body, sgrid, eaten):
+    """
+    Vérifie qu'après une sortie de map, on peut revenir avant de tomber
+    dans le vide (bas de la map).
+    """
+
+    test = apply_gravity(body, sgrid, eaten)
+
+    if test is None:
+        return False
+
+    hx, hy = test[0]
+
+    # si on est déjà tout en bas -> mort
+    if hy >= height - 1:
+        return False
+
+    # vérifier qu'on peut revenir dans la map
+    for _, dx, dy in DIRS:
+        nx, ny = hx + dx, hy + dy
+
+        if 0 <= nx < width and 0 <= ny < height:
+            c = cell(sgrid, nx, ny)
+            if c not in ('#', '0', 'o'):
+                return True
+
+    return False
+
+# ══════════════════════════════════════════════════════════════
+#  SIMULATION D'UN MOUVEMENT
+# ══════════════════════════════════════════════════════════════
+def sim_move(body, dx, dy, sgrid, eaten):
+    """
+    Simule un deplacement + gravite.
+    Retourne (nouveau_corps, nouveau_eaten) ou (None, eaten) si fatal.
+
+    Queue walkable : si pas de nourriture, la queue se libere -> bset = body[:-1].
+    Energie mangee propagee dans 'eaten' pour coherence physique.
+    """
+    hx, hy = body[0]
+    nx, ny  = hx + dx, hy + dy
+
+    if ny < 0 or ny >= height:
+        return None, eaten
+
+    c = cell(sgrid, nx, ny)
+    if (nx, ny) in eaten:
+        c = '.'
+    # sortie laterale
+    if nx < 0 or nx >= width:
+        test_body = [(nx, ny)] + list(body[:-1])
+        if not void_fall_safe(test_body, sgrid, eaten):
+            return None, eaten
+
+    bset = set(body) if c == '$' else set(body[:-1])
+    if c in ('#', '0', 'o') or (nx, ny) in bset:
+        return None, eaten
+
+    if c == '$':
+        new_body  = [(nx, ny)] + list(body)
+        new_eaten = eaten | {(nx, ny)}
+    else:
+        new_body  = [(nx, ny)] + list(body[:-1])
+        new_eaten = eaten
+
+    return apply_gravity(new_body, sgrid, new_eaten), new_eaten
+
+
+# ══════════════════════════════════════════════════════════════
+#  FLOOD FILL HEURISTIQUE
+# ══════════════════════════════════════════════════════════════
+def count_reachable(hx, hy, sgrid, body_set, eaten, limit):
+    """
+    Flood-fill simplifie depuis (hx, hy) pour estimer l'espace disponible.
+    S'arrete a 'limit' cellules pour rester rapide.
+    """
+    start   = (hx, hy)
+    visited = {start}
+    q       = deque([start])
+    while q and len(visited) < limit:
+        x, y = q.popleft()
+        for _, dx, dy in DIRS:
+            nx, ny = x + dx, y + dy
+            if (nx, ny) in visited or (nx, ny) in body_set:
+                continue
+            if ny < 0 or ny >= height:
+                continue
+            c = cell(sgrid, nx, ny)
+            if (nx, ny) in eaten:
+                c = '.'
+            if c in ('#', '0', 'o'):
+                continue
+            visited.add((nx, ny))
+            q.append((nx, ny))
+    return len(visited)
+
+
+# ══════════════════════════════════════════════════════════════
+#  CARTE DE DANGER (prediction ennemis T+1 et T+2)
+# ══════════════════════════════════════════════════════════════
+def build_danger_map(snakes, opp_snakes):
+    """
+    Attribue des penalites de cout aux cases proches des tetes ennemies.
+    T+0 (tete) : 12 pts    - collision mortelle quasi certaine
+    T+1 (adj)  :  7 pts    - case atteignable par l'ennemi au prochain tour
+    T+2        :  2 pts    - attention mais navigable
+    Le contact corps/tete ennemi est BENEFIQUE -> pas de penalite sur le corps ennemi.
+    """
+    danger = {}
+    for sid, body in snakes.items():
+        if sid not in opp_snakes:
+            continue
+        hx, hy = body[0]
+        danger[(hx, hy)] = danger.get((hx, hy), 0) + 12
+        for _, dx, dy in DIRS:
+            nx, ny = hx + dx, hy + dy
+            if 0 <= ny < height:
+                danger[(nx, ny)] = danger.get((nx, ny), 0) + 7
+        for _, dx, dy in DIRS:
+            nx, ny = hx + dx, hy + dy
+            for _, dx2, dy2 in DIRS:
+                nx2, ny2 = nx + dx2, ny + dy2
+                if 0 <= ny2 < height:
+                    danger[(nx2, ny2)] = max(danger.get((nx2, ny2), 0), 2)
+    return danger
+
+
+# ══════════════════════════════════════════════════════════════
+#  ZONE RUSH (early game)
+# ══════════════════════════════════════════════════════════════
+def richest_zone_targets(power_sources, turn):
+    """
+    Retourne les sources de la zone la plus dense pour les 20 premiers tours.
+    L'alpha doit rusher cette zone avant l'adversaire.
+    """
+    if turn > 20 or len(power_sources) <= 2:
+        return power_sources
+
+    mid_x, mid_y = width // 2, height // 2
+    quads = {0: [], 1: [], 2: [], 3: []}
+    for tx, ty in power_sources:
+        q = (1 if tx >= mid_x else 0) + (2 if ty >= mid_y else 0)
+        quads[q].append((tx, ty))
+
+    best_q   = max(quads, key=lambda q: len(quads[q]))
+    best_pts = quads[best_q]
+
+    if len(best_pts) >= len(power_sources) * 0.35 and len(best_pts) >= 2:
+        return best_pts
+    return power_sources
+
+
+# ══════════════════════════════════════════════════════════════
+#  VALIDATION D'UN OBJECTIF (detection de piege post-repas)
+# ══════════════════════════════════════════════════════════════
+def validate_target(target, body, sgrid, ps_count):
+    """
+    Verifie qu'apres avoir mange 'target', le snake n'est pas piege.
+    Simule la croissance + gravite depuis la position de la cible.
+    Si ps_count <= 1 : la partie s'arrete apres -> validation automatique.
+    """
+    if ps_count <= 1:
+        return True   # derniere energie : on y va, la partie se termine
+
+    tx, ty    = target
+    new_eaten = frozenset({(tx, ty)})
+    fake_body = [(tx, ty)] + list(body)   # grandit
+    after     = apply_gravity(fake_body, sgrid, new_eaten)
+    if after is None:
+        return False   # mourir en mangeant = piege
+
+    body_set = frozenset(after[:-1])
+    free     = count_reachable(after[0][0], after[0][1], sgrid, body_set, new_eaten, len(after) * 3)
+    return free >= len(after)
+
+
+# ══════════════════════════════════════════════════════════════
+#  A* AVEC PENALITES PHYSIQUES ET DANGER
+# ══════════════════════════════════════════════════════════════
+def astar(body, targets, sgrid, danger_map, ps_count, time_budget_ms=15):
+    """
+    A* avec corps complet comme etat.
+    Retourne (premiere_direction, cible_atteinte) ou (None, None).
+
+    Penalites dans le g-cout :
+      +0.5  UP : souvent suivi d'une chute = tour perdu
+      +0.4  par case de chute subie (gravite)
+      x0.4  danger ennemi (cases proches des tetes ennemies)
+
+    Filtrage des cibles pieges via validate_target avant de commencer.
+    Impasse detectable : flood_fill < len(body) au niveau 1 (si ps_count > 1).
+    """
+    if not targets:
+        return None, None
+
+    # Filtrer les cibles qui sont des pieges (sauf si toutes le sont)
+    safe_targets = [t for t in targets if validate_target(t, body, sgrid, ps_count)]
+    target_list  = safe_targets if safe_targets else targets
+    target_set   = set(target_list)
+
+    t0      = time.time()
+    counter = 0
+
+    def h(pos):
+        return min(abs(pos[0] - tx) + abs(pos[1] - ty) for tx, ty in target_list)
+
+    def step_cost(head_before, head_after, dy):
+        cost = 1.0
+        cost += 0.5 if dy == -1 else 0.0                            # penalite UP
+        cost += danger_map.get(head_after, 0) * 0.4                 # danger ennemi
+        cost += max(0, head_after[1] - (head_before[1] + dy)) * 0.4 # penalite chute
+        return cost
+
+    eaten0   = frozenset()
+    init_key = (tuple(body), eaten0)
+    g_score  = {init_key: 0.0}
+    heap     = []
+
+    # Niveau 1 : expansion directe depuis le corps initial
+    for name, dx, dy in DIRS:
+        nb, ne = sim_move(body, dx, dy, sgrid, eaten0)
+        if nb is None:
+            continue
+
+        # Rejet des impasses immédiates (sauf derniere energie)
+        if ps_count > 1:
+            free = count_reachable(nb[0][0], nb[0][1], sgrid,
+                                   frozenset(nb[:-1]), ne, len(body) * 2)
+            if free < len(body):
+                continue
+
+        g         = step_cost(body[0], nb[0], dy)
+        state_key = (tuple(nb), ne)
+        if g < g_score.get(state_key, INF):
+            g_score[state_key] = g
+            counter += 1
+            heapq.heappush(heap, (g + h(nb[0]), counter, g, tuple(nb), ne, name))
+
+        if nb[0] in target_set:
+            return name, nb[0]
+
+    # Expansion A* classique
+    while heap:
+        if (time.time() - t0) * 1000 >= time_budget_ms:
+            break
+
+        _, _, g_pop, cur_bt, cur_eaten, first = heapq.heappop(heap)
+        cur_key = (cur_bt, cur_eaten)
+
+        if g_pop > g_score.get(cur_key, INF) + 1e-9:
+            continue   # entree perimeee (g meilleur deja traite)
+
+        cur_body = list(cur_bt)
+
+        for _, dx, dy in DIRS:
+            nb, ne = sim_move(cur_body, dx, dy, sgrid, cur_eaten)
+            if nb is None:
+                continue
+
+            new_g     = g_pop + step_cost(cur_body[0], nb[0], dy)
+            state_key = (tuple(nb), ne)
+
+            if new_g < g_score.get(state_key, INF):
+                g_score[state_key] = new_g
+                counter += 1
+                heapq.heappush(heap, (new_g + h(nb[0]), counter, new_g, tuple(nb), ne, first))
+
+            if nb[0] in target_set:
+                return first, nb[0]
+
+    return None, None
+
+
+# ══════════════════════════════════════════════════════════════
+#  FALLBACK SURVIE (maximise l'espace, evite le danger)
+# ══════════════════════════════════════════════════════════════
+def best_survival_move(body, sgrid, danger_map):
+    """
+    Choisit la direction avec le meilleur score (espace libre - penalite danger).
+    Remplace le 'premier mouvement valide' par un vrai choix de survie.
+    """
+    best_dir   = None
+    best_score = -INF
+    for name, dx, dy in DIRS:
+        nb, ne = sim_move(body, dx, dy, sgrid, frozenset())
+        if nb is None:
+            continue
+        space   = count_reachable(nb[0][0], nb[0][1], sgrid, frozenset(nb[:-1]), ne, 400)
+        danger  = danger_map.get(nb[0], 0)
+        score   = space - danger * 3
+        if score > best_score:
+            best_score = score
+            best_dir   = name
+    return best_dir
+
+
+# ══════════════════════════════════════════════════════════════
+#  BOUCLE DE JEU
+# ══════════════════════════════════════════════════════════════
+while True:
+    t_start = time.time()
+    turn   += 1
+
+    # Reconstruction de la grille
+    grid = [row[:] for row in base_grid]
+
+    power_sources = []
+    ps_count = int(input())
+    for _ in range(ps_count):
+        x, y = map(int, input().split())
+        power_sources.append((x, y))
+        grid[y][x] = '$'
+
+    snakes     = {}
+    sbot_count = int(input())
+    for _ in range(sbot_count):
+        parts  = input().split()
+        sid    = int(parts[0])
+        coords = [tuple(map(int, p.split(','))) for p in parts[1].split(':')]
+        snakes[sid] = coords
+        mark = '0' if sid in my_snakes else 'o'
+        for x, y in coords:
+            if 0 <= x < width and 0 <= y < height:
+                grid[y][x] = mark
+
+    enemy_heads = {snakes[sid][0] for sid in opp_snakes if sid in snakes}
+    my_heads = {snakes[sid][0] for sid in my_snakes if sid in snakes}
+    all_heads = enemy_heads | my_heads
+
+    # Carte de danger basee sur les tetes ennemies (T+1 et T+2)
+    danger_map   = build_danger_map(snakes, opp_snakes)
+
+    # Zone dense pour le rush du debut de partie
+    zone_targets = richest_zone_targets(power_sources, turn)
+
+    # Tri des snakes : le plus long en premier (role alpha)
+    # L'alpha rush la zone dense ; les sweepers prennent le reste.
+    my_alive = [(sid, snakes[sid]) for sid in my_snakes if sid in snakes]
+    my_alive.sort(key=lambda x: -len(x[1]))
+
+    actions        = []
+    assigned       = {}   # target -> sid (attribution reelle via A*)
+    n_alive        = max(len(my_alive), 1)
+    time_per_snake = max(2, 40 // n_alive)
+
+    for i, (sid, body) in enumerate(my_alive):
+
+        # Grille sans le propre corps du snake (evite fausse auto-collision)
+        sgrid = [row[:] for row in grid]
+        for x, y in body:
+            if 0 <= x < width and 0 <= y < height:
+                sgrid[y][x] = '.'
+
+        # Alpha (indice 0, le plus long) : rush zone dense en debut de partie
+        pool = zone_targets if (i == 0 and turn <= 20) else power_sources
+
+        # Cibles disponibles non encore assignees
+        avail = [t for t in pool if t not in assigned]
+        if not avail:
+            avail = [t for t in power_sources if t not in assigned]
+        if not avail:
+            avail = power_sources   # fallback : concurrence directe
+
+        move, reached = astar(body, avail, sgrid, danger_map, ps_count, time_per_snake)
+
+        if reached and reached not in assigned:
+            assigned[reached] = sid
+
+        if move is None:
+            move = best_survival_move(body, sgrid, danger_map)
+
+        if move:
+            actions.append(f"{sid} {move}")
+
+    print(";".join(actions) if actions else "WAIT")
+
+    # Debug stderr
+    elapsed = (time.time() - t_start) * 1000
+    print(f"=> {elapsed:.1f}ms | turn={turn} | alive={[sid for sid,_ in my_alive]} | powers={ps_count}",
+          file=sys.stderr, flush=True)
+    for y in range(height):
+        print(f"{y:2d} {''.join(grid[y])}", file=sys.stderr, flush=True)
